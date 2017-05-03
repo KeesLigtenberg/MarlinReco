@@ -376,7 +376,7 @@ void TPCDigiProcessor::init()
   
 }
 
-void TPCDigiProcessor::processRunHeader( LCRunHeader* run) 
+void TPCDigiProcessor::processRunHeader( LCRunHeader*)
 { 
   _nRun++ ;
 } 
@@ -472,7 +472,6 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
   catch(DataNotAvailableException &e){
   }
   
-  float edep=0.0;
   if( STHcol != 0 ){
     
     int n_sim_hits = STHcol->getNumberOfElements()  ;
@@ -505,7 +504,6 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
       
       _SimTHit = dynamic_cast<SimTrackerHit*>( STHcol->getElementAt( i ) ) ;
       
-      float edep;
       double padPhi(0.0);
       double padTheta (0.0);
       
@@ -693,8 +691,6 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
         continue;
       }
       
-      edep = _SimTHit->getEDep();
-      
       // Calculate Point Resolutions according to Ron's Formula 
       
       // sigma_{RPhi}^2 = sigma_0^2 + Cd^2/N_{eff} * L_{drift}
@@ -762,7 +758,7 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
       }
       
       //get energy deposit of this row
-      edep=_SimTHit->getEDep();
+      float edep=_SimTHit->getEDep();
 
       // create a tpc voxel hit and store it for this row
       Voxel_tpc * atpcVoxel = new Voxel_tpc(iRowHit,iPhiHit,iZHit, thisPoint, edep, tpcRPhiRes, tpcZRes);
@@ -847,7 +843,7 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
       double tpcZRes = _binningZ;
       
       //get energy deposit of this hit
-      edep=_SimTHit->getEDep();
+      float edep=_SimTHit->getEDep();
 
      // create a tpc voxel hit for this simhit and store it for this tpc pad row
       Voxel_tpc * atpcVoxel = new Voxel_tpc(iRowHit,iPhiHit,iZHit, thisPoint, edep, tpcRPhiRes, tpcZRes);
@@ -1343,7 +1339,7 @@ void TPCDigiProcessor::increaseClassificationCounter(EVENT::MCParticle* mcp) {
     }
 }
 
-void TPCDigiProcessor::check( LCEvent * evt ) 
+void TPCDigiProcessor::check( LCEvent*  )
 { 
   // nothing to check here - could be used to fill checkplots in reconstruction processor
 }
@@ -1371,8 +1367,8 @@ void TPCDigiProcessor::end()
 void TPCDigiProcessor::writeVoxelToHit( Voxel_tpc* aVoxel){
   
   const gear::TPCParameters& gearTPC = Global::GEAR->getTPCParameters() ;
-  const gear::PadRowLayout2D& padLayout = gearTPC.getPadLayout() ;
-  const gear::Vector2D padCoord = padLayout.getPadCenter(1) ;
+//  const gear::PadRowLayout2D& padLayout = gearTPC.getPadLayout() ;
+//  const gear::Vector2D padCoord = padLayout.getPadCenter(1) ;
   
   Voxel_tpc* seed_hit  = aVoxel;
   
@@ -1628,7 +1624,7 @@ void TPCDigiProcessor::writeMergedVoxelsToHit( vector <Voxel_tpc*>* hitsToMerge)
   
   const gear::TPCParameters& gearTPC = Global::GEAR->getTPCParameters() ;
   const gear::PadRowLayout2D& padLayout = gearTPC.getPadLayout() ;
-  const gear::Vector2D padCoord = padLayout.getPadCenter(1) ;
+//  const gear::Vector2D padCoord = padLayout.getPadCenter(1) ;
   
   TrackerHitImpl* trkHit = new TrackerHitImpl ;
   
