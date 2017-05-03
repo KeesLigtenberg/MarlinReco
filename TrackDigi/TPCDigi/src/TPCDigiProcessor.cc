@@ -1155,7 +1155,6 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
 
   LCFlagImpl colFlag( STHcol->getFlag() ) ;    
     
-  float edep=0.0;
   // make sure that all the pointers are initialise to NULL
   _mcp=NULL;         
   _previousMCP=NULL; 
@@ -1171,16 +1170,9 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
   
   // loop over all the pad row based sim hits
   for(int i=0; i< n_sim_hits; i++){
-    // this will used for nominaml smearing for very low pt rubish, so set it to zero initially
-    double ptSqrdMC = 0;
     
     _SimTHit = dynamic_cast<SimTrackerHit*>( STHcol->getElementAt( i ) ) ;
     if(!_SimTHit) streamlog_out(DEBUG)<<"could not get/cast SimTrackerHit*"<<std::endl;
-
-    float edep;
-    double padPhi(0.0);
-    double padTheta (0.0);
-    
     
     streamlog_out(DEBUG3) << "processing hit " << i << std::endl;
     streamlog_out(DEBUG3) << " address = " << _SimTHit  
@@ -1190,7 +1182,7 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
     << std::endl ; 
     
     CLHEP::Hep3Vector thisPoint(_SimTHit->getPosition()[0],_SimTHit->getPosition()[1],_SimTHit->getPosition()[2]);
-    double padheight =  tpcData->padHeight; //get from DD4hep if pixelTPC
+//    double padheight =  tpcData->padHeight; //get from DD4hep if pixelTPC
     
     //double bFieldVec[3];
     //lcdd.field().magneticField(DD4hep::Geometry::Position(0,0,0),bFieldVec );
@@ -1198,7 +1190,7 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
     double bField=lcdd.constantAsDouble("Field_nominal_value");
     //streamlog_out(DEBUG)<<"bFieldVec[]=("<<bFieldVec[0]<<", "<<bFieldVec[1]<<", "<<bFieldVec[2]<<")"<<endl;
     // conversion constant. r = pt / (FCT*bField)
-    const double FCT = 2.99792458E-4;
+//    const double FCT = 2.99792458E-4;
     
     _mcp = _SimTHit->getMCParticle() ; //get mc particle if available
     increaseClassificationCounter(_mcp); //increase physics and background counters based on availability of mc particle
@@ -1213,8 +1205,6 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
     if(_rejectCellID0 && !layerNumber) {
       continue;
     }
-    
-    edep = _SimTHit->getEDep();
     
     // Calculate Point Resolutions according to Ron's Formula 
     
@@ -1243,24 +1233,25 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
     double tpcRPhiRes = sqrt( aReso + bReso * (driftLength / 10.0) ); // driftLength in cm   
     streamlog_out(DEBUG3) <<"_diffRPhi="<<_diffRPhi<<"  bField="<<bField<<"  aReso="<<aReso<<"  bReso="<<bReso<<"  tpcRPhiRes="<<tpcRPhiRes<<endl;
     _binningZ=1.625 /*ns*/ * 0.07 /*mm/ns*/; //shadow definition, should be in XML. Time bin for gridpix, drift velocity for T2K gas from 1008.5068v2.pdf
-    double _pointResoZ0=_binningZ;
-    double tpcZRes  = sqrt( ( _pointResoZ0 * _pointResoZ0  ) + ( _diffZ * _diffZ ) * (driftLength / 10.0) ); // driftLength in cm, diffZ=0.08 mm/sqrt(cm)
+    double pixelResoZ0=_binningZ; // /sqrt(12)?!
+    double tpcZRes  = sqrt( ( pixelResoZ0 * pixelResoZ0  ) + ( _diffZ * _diffZ ) * (driftLength / 10.0) ); // driftLength in cm, diffZ=0.08 mm/sqrt(cm)
       
 
   
     //get indices
-    int iRowHit, iPhiHit, iZHit;
-    int NBinsZ =  (int) ((2.0 * tpcData->driftLength) / _binningZ);
+    int iRowHit, iPhiHit;
     int padIndex=_SimTHit->getCellID0();//first 32 bits: system5-side2-layer17-> empty
     int padIndexSecond32Bits=_SimTHit->getCellID1();
     iRowHit=(padIndex>>7) & 0x0001ffff;
     streamlog_out(DEBUG)<<"row="<<iRowHit<<endl;
     iPhiHit=0;// padLayout.getPadNumber(GearPadIndex);//TODO
     streamlog_out(DEBUG)<<"collumn="<<iPhiHit<<endl;
-    iZHit = (int) ( (float) NBinsZ * (  + thisPoint.z() ) / ( 2.0 * tpcData->driftLength ) ) ;
+
+//    int NBinsZ =  (int) ((2.0 * tpcData->driftLength) / _binningZ);
+//    int iZHit = (int) ( (float) NBinsZ * (  + thisPoint.z() ) / ( 2.0 * tpcData->driftLength ) ) ;
 
     //get energy deposit of this row
-    edep=_SimTHit->getEDep();
+    float edep=_SimTHit->getEDep();
 
     writePixelHit(padIndex, padIndexSecond32Bits, thisPoint, edep, tpcRPhiRes, tpcZRes, _SimTHit);    
     
@@ -1272,12 +1263,7 @@ void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
     
   }
   
-  
-  int number_of_adjacent_hits(0);
-  
   streamlog_out(DEBUG4) << "finished looping over simhits" << endl;
-  
-  int numberOfhitsTreated(0);
 
   // set the parameters to decode the type information in the collection
   // for the time being this has to be done manually
@@ -1490,7 +1476,7 @@ void TPCDigiProcessor::writeVoxelToHit( Voxel_tpc* aVoxel){
   _zSigmaHisto->fill(sqrt(covMat[5]));
 #endif
 
-  SimTrackerHit* theSimHit = _tpcHitMap[seed_hit];
+//  SimTrackerHit* theSimHit = _tpcHitMap[seed_hit];
 //  _histogramKeeper.FillHistograms(trkHit,theSimHit);
 
 }
