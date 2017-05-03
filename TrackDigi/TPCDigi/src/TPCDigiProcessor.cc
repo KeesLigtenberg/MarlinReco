@@ -1,12 +1,13 @@
 /* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
 
 #include "TPCDigiProcessor.h"
+
 #include <iostream>
 #include <iomanip>
-#include <vector>
-#include <map>
 #include <cmath>
 #include <algorithm>
+#include <bitset>
+#include <stdexcept> //stl exception handler
 
 #include <gsl/gsl_randist.h>
 #include "marlin/VerbosityLevels.h"
@@ -14,15 +15,10 @@
 
 #include "Circle.h"
 #include "SimpleHelix.h"
-#include"constants.h"
 #include "LCCylinder.h"
 #include <IMPL/LCFlagImpl.h>
 #include <IMPL/LCRelationImpl.h>
 
-//stl exception handler
-#include <stdexcept>
-#include "constants.h"
-#include "voxel.h"
 
 // STUFF needed for GEAR
 #include <marlin/Global.h>
@@ -30,9 +26,16 @@
 #include <gear/TPCParameters.h>
 #include <gear/PadRowLayout2D.h>
 #include <gear/BField.h>
-//
-#include "UTIL/LCTrackerConf.h"
-#include <UTIL/ILDConf.h>
+
+#include "UTIL/ILDConf.h"
+
+//DD4Hep
+#include "DD4hep/LCDD.h"
+#include "DDRec/DetectorData.h"
+
+//TPCDigi
+#include "constants.h"
+#include "voxel.h"
 
 using namespace lcio ;
 using namespace marlin ;
@@ -424,11 +427,26 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
   }
   
   firstEvent = false ;
-  
+
+  //Get gear
   const gear::TPCParameters& gearTPC = Global::GEAR->getTPCParameters() ;
   const gear::PadRowLayout2D& padLayout = gearTPC.getPadLayout() ;
   // this gets the center of the first pad in the pad layout
   const gear::Vector2D padCoord = padLayout.getPadCenter(1) ;
+  
+  //get DD4hep
+  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+  const std::string TPCReadoutType= lcdd.constantAsString("TPC_readoutType");
+  const bool pixelTPC= (TPCReadoutType=="pixel");
+  if(pixelTPC) streamlog_out(DEBUG)<<"found pixel TPC readout"<<std::endl;
+
+  DD4hep::DDRec::FixedPadSizeTPCData* tpcData = lcdd.detector("TPC").extension<DD4hep::DDRec::FixedPadSizeTPCData>();
+  if(!tpcData) streamlog_out(WARNING)<<"tpcData not found"<<std::endl;
+
+  if(pixelTPC) {
+   processPixelEvent(evt);
+   return;
+  }
   
   // this assumes that the pad width in r*phi is the same for all pads  
   _padWidth = padLayout.getPadWidth(0)*padCoord[0];
@@ -1059,7 +1077,271 @@ void TPCDigiProcessor::processEvent( LCEvent * evt )
   
 }
 
+int getPadRowFromFormula(double r) {
+	  constexpr double toMM=10;
+	  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+	  DD4hep::DDRec::FixedPadSizeTPCData* tpcData = lcdd.detector("TPC").extension<DD4hep::DDRec::FixedPadSizeTPCData>();
+	  int nrow=(r-(tpcData->rMinReadout)*toMM)/(tpcData->padHeight*toMM);
+	  if(nrow>tpcData->maxRow-1) {
+		  streamlog_out(WARNING)<<"adjusted hit from beyond the last row at "<<r<<std::endl;
+		  nrow=tpcData->maxRow-1;
+	  }
+	  nrow=nrow<<7;
+	  return nrow;
+}
 
+int getCellIDFromFormula(const CLHEP::Hep3Vector& position) {
+	  int system=(position.z()<0) ? 100 : 36;//FIXME: properly find system id of tpc
+
+	  int nrow=getPadRowFromFormula(position.perp());
+
+	  return system+nrow;
+}
+
+double roundToRowHeight(double r) {
+	    DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+	   	DD4hep::DDRec::FixedPadSizeTPCData* tpcData = lcdd.detector("TPC").extension<DD4hep::DDRec::FixedPadSizeTPCData>();
+	    constexpr double toMM=10;
+		double padheight=tpcData->padHeight*toMM, rMin= tpcData->rMinReadout*toMM;
+		return std::round( (r-rMin-padheight/2)/padheight )*padheight+rMin+padheight/2;
+}
+
+void TPCDigiProcessor::processPixelEvent( LCEvent * evt ) {
+
+  //get DD4hep
+  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+  const std::string TPCReadoutType= lcdd.constantAsString("TPC_readoutType");
+  const bool pixelTPC= (TPCReadoutType=="pixel");
+  if(pixelTPC) streamlog_out(DEBUG)<<"found pixel TPC readout"<<std::endl;
+
+  DD4hep::DDRec::FixedPadSizeTPCData* tpcData = lcdd.detector("TPC").extension<DD4hep::DDRec::FixedPadSizeTPCData>();
+  if(!tpcData) streamlog_out(WARNING)<<"tpcData not found"<<std::endl;
+
+  //get properties from DD4hep
+  // this assumes that the pad width in r*phi is the same for all pads  
+  _padWidth = tpcData->padWidth;
+  // set size of row_hits to hold (n_rows) vectors
+  _tpcRowHits.resize(tpcData->maxRow);
+  
+  // created the collection which will be written out 
+  _trkhitVec = new LCCollectionVec( LCIO::TRACKERHIT )  ;
+  _relCol = new LCCollectionVec(LCIO::LCRELATION);
+
+  // to store the weights
+  LCFlagImpl lcFlag(0) ;
+  lcFlag.setBit( LCIO::LCREL_WEIGHTED ) ;
+  _relCol->setFlag( lcFlag.getFlag()  ) ;
+
+  //Cell id encoding depends on pixel or pad
+  std::string fieldString=lcdd.idSpecification("TPCCollection").fieldDescription();//get field description from dd4hep
+  streamlog_out(DEBUG)<<"field description is "<<fieldString<<std::endl;
+  _cellid_encoder =  new CellIDEncoder<TrackerHitImpl>( fieldString , _trkhitVec ) ; 
+
+  // first deal with the pad-row based hits from Mokka 
+  LCCollection* STHcol = 0 ;
+  try{
+    STHcol = evt->getCollection( _padRowHitColName ) ;
+  }
+  catch(DataNotAvailableException &e){
+    streamlog_out(WARNING)<<"get pad-row based hits collection has thrown an exception!"<<std::endl;
+    return;
+  }
+  
+
+  if(!STHcol){
+    streamlog_out(WARNING)<<"STHCol, the pad-row based hit collection was not available"<<std::endl;
+    return;
+  }
+  
+  int n_sim_hits = STHcol->getNumberOfElements()  ;
+  _NSimTPCHits = n_sim_hits;
+  streamlog_out(DEBUG4) << "number of Pad-Row based SimHits = " << n_sim_hits << std::endl;
+
+  LCFlagImpl colFlag( STHcol->getFlag() ) ;    
+    
+  float edep=0.0;
+  // make sure that all the pointers are initialise to NULL
+  _mcp=NULL;         
+  _previousMCP=NULL; 
+  _nextMCP=NULL;     
+  _nMinus2MCP=NULL;  
+  _nPlus2MCP=NULL;   
+  
+  _SimTHit=NULL;
+  _previousSimTHit=NULL;
+  _nextSimTHit=NULL;
+  _nMinus2SimHit=NULL;
+  _nPlus2SimHit=NULL;
+  
+  // loop over all the pad row based sim hits
+  for(int i=0; i< n_sim_hits; i++){
+    // this will used for nominaml smearing for very low pt rubish, so set it to zero initially
+    double ptSqrdMC = 0;
+    
+    _SimTHit = dynamic_cast<SimTrackerHit*>( STHcol->getElementAt( i ) ) ;
+    if(!_SimTHit) streamlog_out(DEBUG)<<"could not get/cast SimTrackerHit*"<<std::endl;
+
+    float edep;
+    double padPhi(0.0);
+    double padTheta (0.0);
+    
+    
+    streamlog_out(DEBUG3) << "processing hit " << i << std::endl;
+    streamlog_out(DEBUG3) << " address = " << _SimTHit  
+    << " x = "  << _SimTHit->getPosition()[0] 
+    << " y = "  << _SimTHit->getPosition()[1] 
+    << " z = "  << _SimTHit->getPosition()[2] 
+    << std::endl ; 
+    
+    CLHEP::Hep3Vector thisPoint(_SimTHit->getPosition()[0],_SimTHit->getPosition()[1],_SimTHit->getPosition()[2]);
+    double padheight =  tpcData->padHeight; //get from DD4hep if pixelTPC
+    
+    //double bFieldVec[3];
+    //lcdd.field().magneticField(DD4hep::Geometry::Position(0,0,0),bFieldVec );
+    //double bField=bFieldVec[2]; //z-component
+    double bField=lcdd.constantAsDouble("Field_nominal_value");
+    //streamlog_out(DEBUG)<<"bFieldVec[]=("<<bFieldVec[0]<<", "<<bFieldVec[1]<<", "<<bFieldVec[2]<<")"<<endl;
+    // conversion constant. r = pt / (FCT*bField)
+    const double FCT = 2.99792458E-4;
+    
+    _mcp = _SimTHit->getMCParticle() ; //get mc particle if available
+    increaseClassificationCounter(_mcp); //increase physics and background counters based on availability of mc particle
+    
+    if(!_mcp) {
+    	if(_NBackgroundSimTPCHits==1) streamlog_out(WARNING)<<"DEBUG option: rejecting one or more delta hits!"<<std::endl;
+    	continue; //no deltas!
+    }//*/
+
+
+    int layerNumber = _SimTHit->getCellID0();
+    if(_rejectCellID0 && !layerNumber) {
+      continue;
+    }
+    
+    edep = _SimTHit->getEDep();
+    
+    // Calculate Point Resolutions according to Ron's Formula 
+    
+    // sigma_{RPhi}^2 = sigma_0^2 + Cd^2/N_{eff} * L_{drift}
+    
+    // sigma_0^2 = (50micron)^2 + (900micron*sin(phi))^2
+    // Cd^2/N_{eff}} = 25^2/(22/sin(theta)*h/6mm)
+    // Cd = 25 ( microns / cm^(1/2) )
+    // (this is for B=4T, h is the pad height = pad-row pitch in mm,
+    // theta is the polar angle)       
+    
+    // sigma_{z}^2 = (400microns)^2 + L_{drift}cm * (80micron/sqrt(cm))^2 
+    
+    double driftLength = tpcData->driftLength*10 - (fabs(thisPoint.z()));
+    if (driftLength <0) { 
+      streamlog_out(WARNING) << " TPCDigiProcessor : Warning! driftLength < 0 " << driftLength << " --> Check out your GEAR file!!!!" << std::endl;
+      streamlog_out(WARNING) << "Setting driftLength to 0.1" << std::endl;
+      driftLength = 0.10;
+    }
+    streamlog_out(DEBUG3) << "tpcData->driftLength=" << tpcData->driftLength << "  driftLenght="<<driftLength<<std::endl;
+    
+    //calculate resolution for pixel
+//    double _pointResoRphi0=0.055/sqrt(12);  //shadow definition, should be in XML
+    double aReso =_pointResoRPhi0*_pointResoRPhi0;
+    double bReso = ( (_diffRPhi * _diffRPhi)/ 1.0 ) * ( 4.0 / bField  ) ;    
+    double tpcRPhiRes = sqrt( aReso + bReso * (driftLength / 10.0) ); // driftLength in cm   
+    streamlog_out(DEBUG3) <<"_diffRPhi="<<_diffRPhi<<"  bField="<<bField<<"  aReso="<<aReso<<"  bReso="<<bReso<<"  tpcRPhiRes="<<tpcRPhiRes<<endl;
+    _binningZ=1.625 /*ns*/ * 0.07 /*mm/ns*/; //shadow definition, should be in XML. Time bin for gridpix, drift velocity for T2K gas from 1008.5068v2.pdf
+    double _pointResoZ0=_binningZ;
+    double tpcZRes  = sqrt( ( _pointResoZ0 * _pointResoZ0  ) + ( _diffZ * _diffZ ) * (driftLength / 10.0) ); // driftLength in cm, diffZ=0.08 mm/sqrt(cm)
+      
+
+  
+    //get indices
+    int iRowHit, iPhiHit, iZHit;
+    int NBinsZ =  (int) ((2.0 * tpcData->driftLength) / _binningZ);
+    int padIndex=_SimTHit->getCellID0();//first 32 bits: system5-side2-layer17-> empty
+    int padIndexSecond32Bits=_SimTHit->getCellID1();
+    iRowHit=(padIndex>>7) & 0x0001ffff;
+    streamlog_out(DEBUG)<<"row="<<iRowHit<<endl;
+    iPhiHit=0;// padLayout.getPadNumber(GearPadIndex);//TODO
+    streamlog_out(DEBUG)<<"collumn="<<iPhiHit<<endl;
+    iZHit = (int) ( (float) NBinsZ * (  + thisPoint.z() ) / ( 2.0 * tpcData->driftLength ) ) ;
+
+    //get energy deposit of this row
+    edep=_SimTHit->getEDep();
+
+    writePixelHit(padIndex, padIndexSecond32Bits, thisPoint, edep, tpcRPhiRes, tpcZRes, _SimTHit);    
+    
+    // move the pointers on 
+    _nMinus2MCP = _previousMCP;
+    _previousMCP = _mcp ;
+    _nMinus2SimHit = _previousSimTHit;
+    _previousSimTHit = _SimTHit;
+    
+  }
+  
+  
+  int number_of_adjacent_hits(0);
+  
+  streamlog_out(DEBUG4) << "finished looping over simhits" << endl;
+  
+  int numberOfhitsTreated(0);
+
+  // set the parameters to decode the type information in the collection
+  // for the time being this has to be done manually
+  // in the future we should provide a more convenient mechanism to 
+  // decode this sort of meta information
+  StringVec typeNames ;
+  IntVec typeValues ;
+  typeNames.push_back( LCIO::TPCHIT ) ;
+  typeValues.push_back( 1 ) ;
+  _trkhitVec->parameters().setValues("TrackerHitTypeNames" , typeNames ) ;
+  _trkhitVec->parameters().setValues("TrackerHitTypeValues" , typeValues ) ;
+  
+  // add the collection to the event
+  evt->addCollection( _trkhitVec , _TPCTrackerHitsCol ) ;
+  evt->addCollection( _relCol , _outRelColName ) ;
+  
+  streamlog_out(DEBUG4) << "_NSimTPCHits = " << _NSimTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NBackgroundSimTPCHits = " << _NBackgroundSimTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NPhysicsSimTPCHits = " << _NPhysicsSimTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NPhysicsAbove02GeVSimTPCHits = " << _NPhysicsAbove02GeVSimTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NPhysicsAbove1GeVSimTPCHits = " << _NPhysicsAbove1GeVSimTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NRecTPCHits = " << _NRecTPCHits<< endl;
+  streamlog_out(DEBUG4) << "_NLostPhysicsTPCHits = " << _NLostPhysicsTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NLostPhysicsAbove02GeVPtTPCHits = " << _NLostPhysicsAbove02GeVPtTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NLostPhysicsAbove1GeVPtTPCHits = " << _NLostPhysicsAbove1GeVPtTPCHits << endl;
+  streamlog_out(DEBUG4) << "_NRevomedHits = " << _NRevomedHits << endl;
+  
+  _nEvt++;  
+  //Clear the maps and the end of the event.
+  _tpcHitMap.clear();
+  _tpcRowHits.clear();
+  
+  delete _cellid_encoder ;
+  
+}
+
+void TPCDigiProcessor::increaseClassificationCounter(EVENT::MCParticle* mcp) {
+     // increase the counters for the different classification of simhits
+    if(mcp){ 
+      
+      // get the pt of the MCParticle, this will used later to uses nominal smearing for low momentum rubish
+      const double *momentumMC = mcp->getMomentum();
+      double ptSqrdMC = momentumMC[0]*momentumMC[0]+momentumMC[1]*momentumMC[1] ; 
+      
+      streamlog_out(DEBUG3)  << " mcp address = " << mcp
+      << " px = "  << momentumMC[0] 
+      << " py = "  << momentumMC[1] 
+      << " pz = "  << momentumMC[2] 
+      << std::endl ; 
+      
+      // SJA:FIXME: the fact that it is a physics hit relies on the fact that for overlay 
+      // the pointer to the mcp is set to NULL. This distinction may not always be true ...
+      ++_NPhysicsSimTPCHits ;
+      if( ptSqrdMC > (0.2*0.2) ) ++_NPhysicsAbove02GeVSimTPCHits ;
+      if( ptSqrdMC > 1.0 )  ++_NPhysicsAbove1GeVSimTPCHits ;
+      
+    } else {
+      ++_NBackgroundSimTPCHits;
+    }
+}
 
 void TPCDigiProcessor::check( LCEvent * evt ) 
 { 
@@ -1151,13 +1433,13 @@ void TPCDigiProcessor::writeVoxelToHit( Voxel_tpc* aVoxel){
     throw Exception(errorMsg.str());
   }
   
-  // For no error in R
-  float covMat[TRKHITNCOVMATRIX]={float(sin(unsmearedPhi)*sin(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes),
-                                  float(-cos(unsmearedPhi)*sin(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes),
-                                  float(cos(unsmearedPhi)*cos(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes),
-                                  float(0.),
-                                  float(0.),
-                                  float(tpcZRes*tpcZRes) };
+  // Covariance matrix for no error in R
+  float covMat[TRKHITNCOVMATRIX]={float(sin(unsmearedPhi)*sin(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes), //xx
+                                  float(-cos(unsmearedPhi)*sin(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes), //xy
+                                  float(cos(unsmearedPhi)*cos(unsmearedPhi)*tpcRPhiRes*tpcRPhiRes), //yy
+                                  float(0.), //zx
+                                  float(0.), //zy
+                                  float(tpcZRes*tpcZRes) }; //zz
   
   trkHit->setCovMatrix(covMat);      
   
@@ -1211,6 +1493,135 @@ void TPCDigiProcessor::writeVoxelToHit( Voxel_tpc* aVoxel){
   _rPhiSigmaHisto->fill(sqrt((covMat[2])/(cos(point.phi())*cos(point.phi()))));
   _zSigmaHisto->fill(sqrt(covMat[5]));
 #endif
+
+  SimTrackerHit* theSimHit = _tpcHitMap[seed_hit];
+//  _histogramKeeper.FillHistograms(trkHit,theSimHit);
+
+}
+
+//TODO: fix CELLID0, currently CELLID0 is recalculated!
+void TPCDigiProcessor::writePixelHit(int cellID0, int cellID1, CLHEP::Hep3Vector point, double Edep, double tpcRPhiRes, double tpcZRes, SimTrackerHit* simHit){
+  streamlog_out(DEBUG)<<"writePixelHit("<<cellID0<<", "<<cellID1<<", "<<point<<", "<<Edep<<", "<<tpcRPhiRes<<", "<<tpcZRes<<", "<<simHit<<")"<<endl;
+
+  //get tpc parameters
+  DD4hep::Geometry::LCDD& lcdd = DD4hep::Geometry::LCDD::getInstance();
+  DD4hep::DDRec::FixedPadSizeTPCData* tpcData = lcdd.detector("TPC").extension<DD4hep::DDRec::FixedPadSizeTPCData>();
+  
+  auto const originalPoint=point;
+  double unsmearedPhi = point.phi();
+  //proceed smearing through option 1: smearing orthogonal to momentum, option 2 smearing in all directions independently , option 3 smear in random direction(wrong)
+
+  double randrp = 0; //gsl_ran_gaussian(_random, tpcRPhiRes ); //option1
+//  double randr = gsl_ran_gaussian(_random,tpcRPhiRes); //opt2
+//  double randdir= gsl_ran_flat(_random, 0, 2*M_PI); //opt3
+  double randz  = 0;// gsl_ran_gaussian(_random,tpcZRes);
+  
+//  point.setPhi( point.phi() + randrp/ point.perp() ); //opt2
+//  point.setRho( roundToRowHeight(point.rho() +randr ) );/**/
+  
+  CLHEP::Hep3Vector orthogonalMomentumXY(simHit->getMomentum()[1],-simHit->getMomentum()[0],0); //opt1
+  point+= randrp* (orthogonalMomentumXY.unit()); //opt1
+  point.setRho( roundToRowHeight(point.rho()) ); //opt1
+  point.setZ( point.z() + randz );
+
+
+  //do special cuts on all hits closer than 10 mm to edge
+  //check if orignalPoint is near inner edge
+
+  if( originalPoint.perp() < tpcData->rMinReadout*CLHEP::cm+10 ) {
+	  //construct point pointing towards edge boundary
+	  auto boundaryVector= originalPoint.unit()*(tpcData->rMinReadout*CLHEP::cm+5)/sin(originalPoint.theta());
+	  if(point.mag()<boundaryVector.mag()) {
+  		streamlog_out(DEBUG)<<"rejecting hit near the edges of the tpc"<<std::endl;
+  		return;
+	  }
+  }
+  if( originalPoint.perp() > tpcData->rMaxReadout*CLHEP::cm-10) {
+	  //construct point pointing towards edge boundary
+	  auto boundaryVector= originalPoint.unit()*(tpcData->rMaxReadout*CLHEP::cm-5)/sin(originalPoint.theta());
+	  if(point.mag()>boundaryVector.mag()) {
+  		streamlog_out(DEBUG)<<"rejecting hit near the edges of the tpc"<<std::endl;
+  		return;
+	  }
+  }
+  if( fabs(originalPoint.z())>tpcData->driftLength*CLHEP::cm-10 ) {
+	  auto boundaryVector= originalPoint.unit()*(tpcData->driftLength*CLHEP::cm-5)/cos(originalPoint.theta());
+	  if(point.mag()>boundaryVector.mag()) {
+  		streamlog_out(DEBUG)<<"rejecting hit near the edges of the tpc"<<std::endl;
+  		return;
+	  }
+  }
+
+
+  // make sure the hit is not smeared beyond the TPC Max DriftLength
+  if( fabs(point.z()) > tpcData->driftLength*10 ) {return;} //point.setZ( (fabs(point.z()) / point.z() ) * tpcData->driftLength*10 );
+  // or beyond beyond radius
+  const double rmax=tpcData->rMaxReadout*10, rmin=tpcData->rMinReadout*10, halfpadheight=tpcData->padHeight*10/2;
+  if( point.perp() > rmax-halfpadheight ) {return;}//point.setPerp(rmax-halfpadheight);
+  if( point.perp() < rmin+halfpadheight ) {return;}//point.setPerp(rmin+halfpadheight);
+
+
+  //store hit variables
+  TrackerHitImpl* trkHit = new TrackerHitImpl();
+
+  double pos[3] = {point.x(),point.y(),point.z()}; 
+  trkHit->setPosition(pos);
+  trkHit->setEDep(Edep);
+  //replace row index by index after smearing
+//  cellID0&=0xff00007f; //strip index //system5:side2:layer17:module:20 FIXME: get from dd4hep
+//  cellID0+= (getPadRowFromFormula(point.perp())<<7);//add new index
+  cellID0=getCellIDFromFormula(point);
+  trkHit->setCellID0(cellID0);
+  trkHit->setCellID1(cellID1);
+  
+  // check values for inf and nan
+  if( std::isnan(unsmearedPhi) || std::isinf(unsmearedPhi) || std::isnan(tpcRPhiRes) || std::isinf(tpcRPhiRes) ) {
+    std::stringstream errorMsg;
+    errorMsg << "\nProcessor: TPCDigiProcessor \n" 
+    << "unsmearedPhi = "
+    <<  unsmearedPhi
+    << " tpcRPhiRes = "
+    <<  tpcRPhiRes 
+    << "\n" ;
+    throw Exception(errorMsg.str());
+  }
+  
+
+  // For no error in R, see writeHit
+  //add error caused by rounding to position in R direction to pixel. Do here to include phi dependence
+  double hitphi=point.phi();
+  double RoundError2=tpcData->padHeight*10.*tpcData->padHeight*10./12.;// for xx and yy
+  // Covariance of the position (x,y,z), stored as lower triangle matrix. i.e. *  cov(x,x) , cov(y,x) , cov(y,y) , cov(z,x) , cov(z,y) , cov(z,z)
+  float covMat[TRKHITNCOVMATRIX]={float(tpcRPhiRes*tpcRPhiRes + RoundError2*cos(hitphi)*cos(hitphi) ),
+                                  float(0.),
+                                  float(tpcRPhiRes*tpcRPhiRes + RoundError2*sin(hitphi)*sin(hitphi)),
+                                  float(0.),
+                                  float(0.),
+                                  float(tpcZRes*tpcZRes) };
+  trkHit->setCovMatrix(covMat);      
+  
+  if( simHit == NULL ){
+    std::stringstream errorMsg;
+    errorMsg << "\nProcessor: TPCDigiProcessor \n" 
+    << "SimTracker Pointer is NULL throwing exception\n"
+    << "\n" ;
+    throw Exception(errorMsg.str());
+  }
+  
+  if(pos[0]*pos[0]+pos[1]*pos[1]>0.0){ 
+    _trkhitVec->addElement( trkHit ); 
+    _NRecTPCHits++;
+    streamlog_out(DEBUG)<<"output trkHit at "<<point<<endl;
+    
+    //write relation between simTrackerHit and trackerHit
+    LCRelationImpl* rel = new LCRelationImpl;   
+    rel->setFrom (trkHit);
+    rel->setTo (simHit);
+    rel->setWeight( 1.0 );
+    _relCol->addElement(rel); //    push back the SimTHit for this TrackerHit
+
+//    _histogramKeeper.FillHistograms(trkHit,simHit); //update histograms;
+  }
 }
 
 void TPCDigiProcessor::writeMergedVoxelsToHit( vector <Voxel_tpc*>* hitsToMerge){

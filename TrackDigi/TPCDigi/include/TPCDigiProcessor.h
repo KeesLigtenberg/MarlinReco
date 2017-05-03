@@ -22,8 +22,11 @@ Steve Aplin 26 June 2009 (DESY)
 #include <marlin/Processor.h>
 #include <lcio.h>
 
-
+//stl
+#include <vector>
+#include <map>
 #include <string>
+
 #include <gsl/gsl_rng.h>
 
 #ifdef MARLIN_USE_AIDA
@@ -46,9 +49,8 @@ Steve Aplin 26 June 2009 (DESY)
 
 #endif
 
-#include <vector>
-#include <map>
-
+//lcio
+#include <lcio.h>
 #include <EVENT/LCCollection.h>
 #include <IMPL/LCCollectionVec.h>
 #include <EVENT/MCParticle.h>
@@ -135,7 +137,7 @@ public:
   /** Called for every event - the working horse.
    */
   virtual void processEvent( LCEvent * evt ) ; 
-  
+  virtual void processPixelEvent( LCEvent * evt ) ;
   
   virtual void check( LCEvent * evt ) ; 
   
@@ -151,6 +153,9 @@ public:
   double getPadTheta( CLHEP::Hep3Vector* firstPointRPhi, CLHEP::Hep3Vector* middlePointRPhi, CLHEP::Hep3Vector* lastPointRPhi );
 
 protected:
+  //helper function for processing hits
+  void increaseClassificationCounter(EVENT::MCParticle*);
+  void writePixelHit(int cellID0, int cellID1, CLHEP::Hep3Vector point, double Edep, double RPhiRes, double ZRes, SimTrackerHit*);
 
   /** Input collection name.
    */
